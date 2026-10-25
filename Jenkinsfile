@@ -1,30 +1,96 @@
 pipeline {
     agent any
-
     environment {
-        VERCEL_TOKEN = credentials('vercel_token')
+        EKS_CLUSTER     = 'dev-eks-cluster'
+        AWS_REGION      = 'us-east-1'
+        AWS_ACCOUNT_ID  = '123456789012'
+        ECR_REPOSITORY  = 'springboot-app'
+        IMAGE_TAG       = "v1.0.${BUILD_NUMBER}"
+        APP_NAME        = 'springboot-app'
+        K8S_NAMESPACE   = 'default'
     }
-
     stages {
-        stage('Install') {
+        stage('1. Checkout Source') {
             steps {
-                bat 'npm install'
+                echo 'Checking out code from GitHub'
+                git branch: 'main',
+                    credentialsId: 'github-creds',
+                    url: 'https://github.com/Bazanmumtaz/jenkins_123.git'
             }
         }
-        stage('Test') {
+        stage('2. Maven Build') {
             steps {
-                echo 'Skipping tests - no test script found'
+                echo 'Building the application with Maven'
+                sh 'mvn clean package -DskipTests'
             }
         }
-        stage('Build') {
+        stage('3. SonarQube Scan') {
             steps {
-                bat 'npm run build'
+                echo 'Running SonarQube analysis'
+                withSonarQubeEnv('SonarQube') {
+                    sh 'mvn sonar:sonar'
+                }
             }
         }
-        stage('Deploy') {
+        stage('4. Trivy File Scan') {
             steps {
-                bat 'npx vercel --prod --yes --token=%VERCEL_TOKEN%'
+                echo 'Scanning project files with Trivy'
+                sh 'trivy fs .'
             }
+        }
+        stage('5. Docker Build') {
+            steps {
+                echo 'Building Docker image'
+                sh 'docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .'
+            }
+        }
+        stage('6. Trivy Image Scan') {
+            steps {
+                echo 'Scanning Docker image with Trivy'
+                sh 'trivy image ${ECR_REPOSITORY}:${IMAGE_TAG}'
+            }
+        }
+        stage('7. Push Image to Amazon ECR') {
+            steps {
+                echo 'Pushing Docker image to Amazon ECR'
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-creds']
+                ]) {
+                    sh 'aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin \
+                        ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com'
+                    sh 'docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${IMAGE_TAG}'
+                    sh 'docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${IMAGE_TAG}'
+                }
+            }
+        }
+        stage('8. Deploy to Amazon EKS') {
+            steps {
+                echo 'Deploying to Amazon EKS'
+                aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}
+                kubectl set image deployment/${APP_NAME} ${APP_NAME}=\
+                ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${IMAGE_TAG} \
+                -n ${K8S_NAMESPACE}
+            }
+        }
+        stage('9. Verify Deployment') {
+            steps {
+                echo 'Verifying deployment'
+                sh 'kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=120s'
+                sh 'kubectl get pods -n ${K8S_NAMESPACE}'
+                sh 'kubectl get svc -n ${K8S_NAMESPACE}'
+            }
+        }
+    }
+    post {
+        success {
+            echo "SUCCESS : ${JOB_NAME} #${BUILD_NUMBER}"
+            sh "curl -X POST -H 'Content-Type: application/json' ..." // The webhook URL/rest of curl command is truncated in the image
+        }
+        failure {
+            echo 'Cleaning workspace'
+            cleanWs()
         }
     }
 }
